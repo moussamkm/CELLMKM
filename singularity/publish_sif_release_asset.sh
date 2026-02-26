@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Build and optionally upload a Singularity/Apptainer SIF asset for this host architecture.
+
+Usage:
+  singularity/publish_sif_release_asset.sh [options]
+
+Options:
+  --version <semver>             Version string used in asset name (default: 0.2.0)
+  --device <cpu|gpu>             Runtime target (default: cpu)
+  --source <def|docker>          Build from definition file or pull from docker:// (default: def)
+  --tmpdir <path>                Temp dir for singularity/apptainer build/pull
+  --cachedir <path>              Cache dir for singularity/apptainer build/pull
+  --outdir <path>                Output directory for .sif (default: .)
+  --repo <owner/repo>            GitHub repository for release upload (default: tkcaccia/CellPhenotyper)
+  --release-tag <tag>            GitHub release tag (default: v<version>)
+  --docker-repo <image_repo>     OCI image repo used when --source docker (default: ghcr.io/tkcaccia/cellphenotyper)
+  --docker-tag <tag>             OCI image tag override when --source docker
+  --cpu-def <path>               CPU Singularity definition file (default: singularity/cellphenotyper_full_cpu.def)
+  --gpu-def <path>               GPU Singularity definition file (default: singularity/cellphenotyper_full_gpu.def)
+  --upload                        Upload to GitHub release after build
+  --fakeroot                      Use --fakeroot for definition builds (requires host support)
+  --force                         Overwrite existing output file
+  -h, --help                      Show this message
+
+Examples:
+  # Build arm64 CPU SIF on Apple Silicon/Linux ARM and upload it
+  singularity/publish_sif_release_asset.sh --version 0.2.0 --device cpu --upload
+
+  # Build amd64 CPU SIF on Linux amd64 and upload it
+  singularity/publish_sif_release_asset.sh --version 0.2.0 --device cpu --upload
+
+  # Build from docker:// image instead of definition file
+  singularity/publish_sif_release_asset.sh --source docker --device cpu --version 0.2.0 --upload
+USAGE
+}
+
+normalize_arch() {
+  local raw
+  raw="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$raw" in
+    x86_64|amd64|x64|x86-64)
+      echo "amd64"
+      ;;
+    aarch64|arm64|arm64v8|arm64/v8|armv8|armv8l)
+      echo "arm64"
+      ;;
+    *)
+      echo "$raw"
+      ;;
+  esac
+}
+
+VERSION="0.2.0"
+DEVICE="cpu"
+SOURCE="def"
+OUTDIR="."
+USER_TMPDIR=""
+USER_CACHEDIR=""
+REPO="tkcaccia/CellPhenotyper"
+RELEASE_TAG=""
+DOCKER_REPO="ghcr.io/tkcaccia/cellphenotyper"
+DOCKER_TAG=""
+CPU_DEF="singularity/cellphenotyper_full_cpu.def"
+GPU_DEF="singularity/cellphenotyper_full_gpu.def"
+UPLOAD="false"
+USE_FAKEROOT="false"
+FORCE="false"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --version)
+      VERSION="$2"
+      shift 2
+      ;;
+    --device)
+      DEVICE="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+      shift 2
+      ;;
+    --source)
+      SOURCE="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+      shift 2
+      ;;
+    --outdir)
+      OUTDIR="$2"
+      shift 2
+      ;;
+    --tmpdir)
+      USER_TMPDIR="$2"
+      shift 2
+      ;;
+    --cachedir)
+      USER_CACHEDIR="$2"
+      shift 2
+      ;;
+    --repo)
+      REPO="$2"
+      shift 2
+      ;;
+    --release-tag)
+      RELEASE_TAG="$2"
+      shift 2
+      ;;
+    --docker-repo)
+      DOCKER_REPO="$2"
+      shift 2
+      ;;
+    --docker-tag)
+      DOCKER_TAG="$2"
+      shift 2
+      ;;
+    --cpu-def)
+      CPU_DEF="$2"
+      shift 2
+      ;;
+    --gpu-def)
+      GPU_DEF="$2"
+      shift 2
+      ;;
+    --upload)
+      UPLOAD="true"
+      shift
+      ;;
+    --fakeroot)
+      USE_FAKEROOT="true"
+      shift
+      ;;
+    --force)
+      FORCE="true"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "$DEVICE" != "cpu" && "$DEVICE" != "gpu" ]]; then
+  echo "Invalid --device '$DEVICE'. Use cpu or gpu." >&2
+  exit 1
+fi
+
+if [[ "$SOURCE" != "def" && "$SOURCE" != "docker" ]]; then
+  echo "Invalid --source '$SOURCE'. Use def or docker." >&2
+  exit 1
+fi
+
+if [[ -z "$RELEASE_TAG" ]]; then
+  RELEASE_TAG="v${VERSION}"
+fi
+
+SING_BIN="$(command -v singularity || command -v apptainer || true)"
+if [[ -z "$SING_BIN" ]]; then
+  echo "singularity/apptainer was not found in PATH." >&2
+  exit 1
+fi
+
+# Pick sane defaults for build temp/cache when not provided.
+# This avoids filling tiny /tmp tmpfs during OCI->SIF conversion.
+default_tmpdir="/var/tmp/apptainer/tmp"
+default_cachedir="/var/tmp/apptainer/cache"
+tmp_fs_type="$(df -PT /tmp 2>/dev/null | awk 'NR==2 {print $2}')"
+tmp_kb="$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $2}')"
+tmp_total_gb=""
+if [[ -n "${tmp_kb:-}" ]]; then
+  tmp_total_gb="$(awk -v kb="$tmp_kb" 'BEGIN { printf "%.1f", kb/1024/1024 }')"
+fi
+
+if [[ -n "$USER_TMPDIR" ]]; then
+  export SINGULARITY_TMPDIR="$USER_TMPDIR"
+elif [[ -n "${SINGULARITY_TMPDIR:-}" ]]; then
+  export SINGULARITY_TMPDIR
+elif [[ "$tmp_fs_type" == "tmpfs" ]]; then
+  export SINGULARITY_TMPDIR="$default_tmpdir"
+else
+  export SINGULARITY_TMPDIR="/var/tmp"
+fi
+
+if [[ -n "$USER_CACHEDIR" ]]; then
+  export SINGULARITY_CACHEDIR="$USER_CACHEDIR"
+elif [[ -n "${SINGULARITY_CACHEDIR:-}" ]]; then
+  export SINGULARITY_CACHEDIR
+elif [[ "$tmp_fs_type" == "tmpfs" ]]; then
+  export SINGULARITY_CACHEDIR="$default_cachedir"
+else
+  export SINGULARITY_CACHEDIR="/var/tmp/.singularity-cache"
+fi
+
+export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-$SINGULARITY_TMPDIR}"
+export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-$SINGULARITY_CACHEDIR}"
+export TMPDIR="${TMPDIR:-$APPTAINER_TMPDIR}"
+mkdir -p "$SINGULARITY_TMPDIR" "$SINGULARITY_CACHEDIR" "$APPTAINER_TMPDIR" "$APPTAINER_CACHEDIR"
+if [[ "$tmp_fs_type" == "tmpfs" ]]; then
+  echo "INFO: /tmp is tmpfs (${tmp_total_gb:-unknown}G). Using APPTAINER_TMPDIR=$APPTAINER_TMPDIR and APPTAINER_CACHEDIR=$APPTAINER_CACHEDIR"
+fi
+
+HOST_ARCH="$(normalize_arch "$(uname -m)")"
+
+mkdir -p "$OUTDIR"
+if [[ ! -w "$OUTDIR" ]]; then
+  echo "Output directory is not writable: $OUTDIR" >&2
+  echo "Use --outdir /var/tmp/apptainer/out (or another writable path)." >&2
+  exit 1
+fi
+outdir_probe="${OUTDIR%/}/.cellphenotyper_write_test_$$"
+if ! touch "$outdir_probe" 2>/dev/null; then
+  echo "Cannot create files in output directory: $OUTDIR (read-only filesystem?)." >&2
+  echo "Use --outdir /var/tmp/apptainer/out and retry." >&2
+  exit 1
+fi
+rm -f "$outdir_probe"
+
+name_suffix=""
+if [[ "$DEVICE" == "gpu" ]]; then
+  name_suffix="-gpu"
+fi
+ASSET_NAME="cellphenotyper-${VERSION}${name_suffix}-${HOST_ARCH}.sif"
+OUT_SIF="${OUTDIR%/}/${ASSET_NAME}"
+
+if [[ -e "$OUT_SIF" && "$FORCE" != "true" ]]; then
+  echo "Output already exists: $OUT_SIF (use --force to overwrite)" >&2
+  exit 1
+fi
+if [[ -e "$OUT_SIF" && "$FORCE" == "true" ]]; then
+  rm -f "$OUT_SIF"
+fi
+
+if [[ "$SOURCE" == "def" ]]; then
+  DEF_FILE="$CPU_DEF"
+  if [[ "$DEVICE" == "gpu" ]]; then
+    DEF_FILE="$GPU_DEF"
+  fi
+  if [[ ! -f "$DEF_FILE" ]]; then
+    echo "Definition file not found: $DEF_FILE" >&2
+    exit 1
+  fi
+
+  build_cmd=("$SING_BIN" build)
+  if [[ "$USE_FAKEROOT" == "true" ]]; then
+    build_cmd+=(--fakeroot)
+  fi
+  build_cmd+=("$OUT_SIF" "$DEF_FILE")
+
+  if [[ "$USE_FAKEROOT" == "true" || "$EUID" -eq 0 ]]; then
+    "${build_cmd[@]}"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo --preserve-env=SINGULARITY_TMPDIR,SINGULARITY_CACHEDIR,APPTAINER_TMPDIR,APPTAINER_CACHEDIR,TMPDIR "${build_cmd[@]}"
+  else
+    echo "Definition build requires root/sudo or --fakeroot support." >&2
+    exit 1
+  fi
+else
+  if [[ -z "$DOCKER_TAG" ]]; then
+    if [[ "$DEVICE" == "gpu" ]]; then
+      if [[ "$HOST_ARCH" == "amd64" ]]; then
+        DOCKER_TAG="${VERSION}-gpu"
+      else
+        DOCKER_TAG="${VERSION}-gpu-${HOST_ARCH}"
+      fi
+    elif [[ "$HOST_ARCH" == "amd64" ]]; then
+      DOCKER_TAG="${VERSION}-amd64"
+    else
+      DOCKER_TAG="${VERSION}"
+    fi
+  fi
+  OCI_REF="docker://${DOCKER_REPO}:${DOCKER_TAG}"
+  "$SING_BIN" pull --force "$OUT_SIF" "$OCI_REF"
+fi
+
+echo "Built: $OUT_SIF"
+
+if [[ "$UPLOAD" == "true" ]]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "GitHub CLI (gh) is required for --upload." >&2
+    exit 1
+  fi
+
+  if ! gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
+    gh release create "$RELEASE_TAG" --repo "$REPO" --title "$RELEASE_TAG" --notes "Release assets for CellPhenotyper ${VERSION}."
+  fi
+
+  gh release upload "$RELEASE_TAG" "$OUT_SIF" --repo "$REPO" --clobber
+  echo "Uploaded asset '$ASSET_NAME' to $REPO release $RELEASE_TAG"
+fi

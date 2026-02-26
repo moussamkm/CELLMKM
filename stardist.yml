@@ -1,0 +1,47 @@
+name: stardist
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+
+  # Ensure modern GNU C++ runtime in the env (fixes CXXABI mismatches on some hosts)
+  - libstdcxx-ng>=13
+  - libgcc-ng>=13
+
+  # Core scientific + image I/O
+  - numpy
+  - scipy
+  - pandas
+  - scikit-image
+  - matplotlib-base
+  - tqdm
+  - pillow
+  - tifffile
+  - imagecodecs
+
+  # Geometry / geospatial
+  - shapely
+
+  # WSI + tiled image handling
+  - pyvips
+  - openslide
+  - openslide-python
+  - zarr
+
+  # Deep learning (UNI-2)
+  - pytorch
+  - torchvision
+
+  # UNI-2 model loading
+  - huggingface_hub
+  - transformers
+  - timm
+  - accelerate
+  - safetensors
+  - einops
+
+  # StarDist stack installed through pip for ARM compatibility
+  - pip:
+    - stardist
+    - csbdeep

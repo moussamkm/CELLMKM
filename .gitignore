@@ -1,0 +1,34 @@
+.DS_Store
+.nextflow/
+.nextflow.log*
+.nxf/
+cache/
+work/
+work_*/
+results/
+results_*/
+__pycache__/
+*.pyc
+*.pyo
+.hf_cache/
+
+# local credentials
+tokens.env
+GHCRtoken.env
+
+# large local inputs
+Data/*.ome.tif
+Data/*.btf
+!Data/ROI_A.ome.tif
+!Data/ROI_B.ome.tif
+
+# local container artifacts
+singularity/*.sif
+singularity/cellphenotyper_*.sif
+singularity-stardist_UNI-2.sif
+singularity-stardist_UNI-2-m1.sif
+singularity-cellphenotyper-*.sif
+
+# runtime outputs
+*.html
+*.txt

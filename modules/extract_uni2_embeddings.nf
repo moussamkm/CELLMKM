@@ -1,0 +1,176 @@
+process EXTRACT_UNI2_EMBEDDINGS {
+    tag "${sample_id}:${embedding_mode}"
+    label 'compute_heavy'
+    label 'gpu_capable'
+    maxForks 1
+
+    publishDir "${params.outdir_base}/07_embeddings/${sample_id}", mode: 'copy', overwrite: true
+
+    cpus {
+      def requested = Math.max(1, Math.min(params.max_cpus as int, params.uni2_cpus as int))
+      def compute = (params.compute_device ?: 'cpu').toString().toLowerCase()
+      def maxMemGb = params.max_memory_gb as int
+      if (compute != 'gpu' && maxMemGb <= 3) return 1
+      return requested
+    }
+    time { params.uni2_time as String }
+
+    input:
+    tuple val(sample_id), path(image_tif), path(mask_tif), val(embedding_mode), val(zero_outside_mask), val(mask_context_mode), val(outside_fill)
+
+    output:
+    tuple val(sample_id), val(embedding_mode), path("embeddings_${sample_id}_${embedding_mode}"), emit: embeddings_dir
+
+    script:
+    def zero_outside_flag = zero_outside_mask ? "--zero-outside-mask --outside-fill ${outside_fill}" : ''
+    def force_full_flag = params.uni2_force_full_image ? '--force-full-image' : ''
+    def save_tiles_flag = params.uni2_save_tiles ? '--save-tiles' : ''
+    def resolved_mask_context = mask_context_mode ?: params.uni2_mask_context_mode
+    def mask_context_flag = resolved_mask_context ? "--mask-context-mode ${resolved_mask_context}" : ''
+    def inner_square_factor_flag = "--inner-square-factor ${params.uni2_inner_square_factor}"
+    def inner_square_min_flag = "--inner-square-min-px ${params.uni2_inner_square_min_px}"
+    def inner_square_max_flag = "--inner-square-max-px ${params.uni2_inner_square_max_px}"
+    def inner_square_fixed_flag = "--inner-square-fixed-px ${params.uni2_inner_square_fixed_px}"
+    def tiles_root_path = "embeddings_${sample_id}_${embedding_mode}/${params.uni2_tiles_root}"
+    def device_value = params.compute_device == 'gpu' ? 'cuda' : (params.compute_device == 'auto' ? params.uni2_device_auto : 'cpu')
+    def task_mem_gb = task.memory ? Math.max(1, task.memory.toGiga() as int) : Math.max(1, params.max_memory_gb as int)
+    def requested_batch = Math.max(1, params.uni2_batch as int)
+    def initial_batch = requested_batch
+    if (device_value == 'cpu') {
+      if (task_mem_gb <= 4) initial_batch = Math.min(initial_batch, 2)
+      else if (task_mem_gb <= 8) initial_batch = Math.min(initial_batch, 4)
+      else if (task_mem_gb <= 12) initial_batch = Math.min(initial_batch, 8)
+      else if (task_mem_gb <= 16) initial_batch = Math.min(initial_batch, 16)
+    }
+    def resolved_torch_threads = Math.max(1, Math.min(task.cpus as int, params.uni2_torch_threads as int))
+    if (device_value == 'cpu' && task_mem_gb <= 4) {
+      resolved_torch_threads = 1
+    }
+    def resolved_rows_per_csv = Math.max(1000, params.uni2_rows_per_csv as int)
+    if (device_value == 'cpu' && task_mem_gb <= 4) {
+      resolved_rows_per_csv = Math.min(resolved_rows_per_csv, 2000)
+    }
+    def uni2_script = "${projectDir}/${params.uni2_script}"
+    def token_env_file = params.hf_token_env_file ? (params.hf_token_env_file.toString().startsWith('/') ? params.hf_token_env_file : "${projectDir}/${params.hf_token_env_file}") : ''
+    """
+    set -euo pipefail
+
+    TOKEN_ENV_FILE="${token_env_file}"
+    TOKEN_VAR_NAME="${params.hf_token_env_var_name ?: 'HF_TOKEN'}"
+    if [[ -n "\$TOKEN_ENV_FILE" && -f "\$TOKEN_ENV_FILE" ]]; then
+      set -a
+      # shellcheck disable=SC1090
+      source "\$TOKEN_ENV_FILE"
+      set +a
+    fi
+
+    export HF_HOME="${params.hf_home}"
+    export HF_HUB_CACHE="${params.hf_hub_cache}"
+    export HF_TOKEN="\$(printenv "\$TOKEN_VAR_NAME" || true)"
+    if [[ -z "\$HF_TOKEN" ]]; then
+      export HF_TOKEN="\$(printenv HF_TOKEN || true)"
+    fi
+    if [[ -z "\$HF_TOKEN" ]]; then
+      export HF_TOKEN="\$(printenv HF_UNI2 || true)"
+    fi
+
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+    export OPENBLAS_NUM_THREADS=1
+    export NUMEXPR_NUM_THREADS=1
+    export TF_NUM_INTRAOP_THREADS=1
+    export TF_NUM_INTEROP_THREADS=1
+
+    if [[ "${params.gpu_debug_diagnostics}" == "true" && "${params.compute_device}" == "gpu" ]]; then
+      echo "[DEBUG] UNI-2 GPU diagnostics"
+      nvidia-smi -L || true
+      python - <<'PY'
+try:
+    import torch
+    print(f"[DEBUG] torch={torch.__version__} cuda={torch.version.cuda} cuda_available={torch.cuda.is_available()} device_count={torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        print(f"[DEBUG] cuda_device_0={torch.cuda.get_device_name(0)}")
+except Exception as exc:
+    print(f"[DEBUG] Torch diagnostics unavailable: {exc}")
+PY
+    fi
+
+    OUTDIR="embeddings_${sample_id}_${embedding_mode}"
+    ATTEMPT_BATCH=${initial_batch}
+    echo "[INFO] UNI2 runtime tune: mem_gb=${task_mem_gb}, requested_batch=${requested_batch}, start_batch=${initial_batch}, torch_threads=${resolved_torch_threads}, rows_per_csv=${resolved_rows_per_csv}"
+
+    while true; do
+      rm -rf "\$OUTDIR"
+      mkdir -p "\$OUTDIR"
+
+      ATTEMPT_ERR=".uni2_attempt_batch_\${ATTEMPT_BATCH}.err"
+      set +e
+      python "${uni2_script}" \\
+        --image "${image_tif}" \\
+        --mask "${mask_tif}" \\
+        --outdir "\$OUTDIR" \\
+        --image-level ${params.uni2_image_level} \\
+        ${force_full_flag} \\
+        --grid "${params.uni2_grid}" \\
+        --tile-size ${params.uni2_tile_size} \\
+        ${zero_outside_flag} \\
+        ${save_tiles_flag} \\
+        --tiles-root "${tiles_root_path}" \\
+        --bucket-size ${params.uni2_bucket_size} \\
+        --min-area ${params.uni2_min_area} \\
+        ${mask_context_flag} \\
+        ${inner_square_factor_flag} \\
+        ${inner_square_min_flag} \\
+        ${inner_square_max_flag} \\
+        ${inner_square_fixed_flag} \\
+        --encoder "${params.uni2_encoder}" \\
+        --backend "${params.uni2_backend}" \\
+        --pooling "${params.uni2_pooling}" \\
+        --img-size ${params.uni2_img_size} \\
+        --device "${device_value}" \\
+        --batch "\$ATTEMPT_BATCH" \\
+        --torch-threads ${resolved_torch_threads} \\
+        --rows-per-csv ${resolved_rows_per_csv} \\
+        --mask-block ${params.uni2_mask_block} \\
+        2> >(tee "\$ATTEMPT_ERR" >&2)
+      RC=\$?
+      set -e
+
+      if [[ "\$RC" -eq 0 ]]; then
+        echo "[INFO] UNI2 succeeded with batch=\$ATTEMPT_BATCH"
+        break
+      fi
+
+      if grep -Eiq 'No space left on device|not enough free disk space' "\$ATTEMPT_ERR"; then
+        echo "[ERROR] UNI2 cache path has insufficient free disk. Free disk space and rerun." >&2
+        exit "\$RC"
+      fi
+
+      if [[ "\$RC" -ne 137 && "\$RC" -ne 134 && "\$RC" -ne 9 ]] && ! grep -Eiq 'Killed|out of memory|cannot allocate memory' "\$ATTEMPT_ERR"; then
+        echo "[ERROR] UNI2 failed with non-OOM error (exit=\$RC)." >&2
+        exit "\$RC"
+      fi
+
+      if [[ "\$ATTEMPT_BATCH" -le 1 ]]; then
+        echo "[ERROR] UNI2 failed even at batch=1 (exit=\$RC)." >&2
+        exit "\$RC"
+      fi
+
+      NEXT_BATCH=\$(( ATTEMPT_BATCH / 2 ))
+      if [[ "\$NEXT_BATCH" -lt 1 ]]; then
+        NEXT_BATCH=1
+      fi
+      if [[ "\$NEXT_BATCH" -ge "\$ATTEMPT_BATCH" ]]; then
+        NEXT_BATCH=\$(( ATTEMPT_BATCH - 1 ))
+      fi
+      echo "[WARN] UNI2 failed with batch=\$ATTEMPT_BATCH (exit=\$RC). Retrying with batch=\$NEXT_BATCH." >&2
+      ATTEMPT_BATCH="\$NEXT_BATCH"
+    done
+    """
+
+    stub:
+    """
+    mkdir -p "embeddings_${sample_id}_${embedding_mode}"
+    touch "embeddings_${sample_id}_${embedding_mode}/embeddings_000000.csv"
+    """
+}
